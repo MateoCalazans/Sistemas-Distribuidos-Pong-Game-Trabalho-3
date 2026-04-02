@@ -1,0 +1,4 @@
+modo,latencia_media_ms,latencia_maxima_ms,jitter_medio_ms,pacotes_perdidos
+UDP,0.18,3.42,0.03,11322
+UDP,2.02,395.55,0.03,13
+TCP,0.24,166.11,0.03,0
