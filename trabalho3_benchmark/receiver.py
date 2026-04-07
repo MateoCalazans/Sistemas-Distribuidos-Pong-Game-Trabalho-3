@@ -2,26 +2,38 @@
 receiver.py — Receptor do Benchmark TCP vs UDP
 ================================================
 Servidor que escuta conexões TCP e UDP simultaneamente.
-Para cada pacote: registra seq, tamanho, timestamp.
-UDP: envia ACK manual com número de sequência.
-No final de cada rodada: imprime estatísticas.
 
-Uso: python receiver.py [--port PORTA]
+Protocolo binário:
+  Header (12 bytes): seq(4) + tamanho(4) + timestamp(4)
+  Payload: bytes 'X' para completar o tamanho
+
+TCP: recebe mensagens com length-prefix (4 bytes tamanho + dados)
+UDP: recebe datagramas, envia ACK (4 bytes com seq)
+     Suporta --loss para simular perda de pacotes (equivalente ao tc qdisc)
+
+Uso:
+    python receiver.py                   (sem perda simulada)
+    python receiver.py --loss 10         (simula 10% de perda no UDP)
 """
 
 import socket
-import json
+import struct
 import threading
 import time
 import argparse
+import random
 
 
 # ======================================================================
 # CONSTANTES
 # ======================================================================
 
-BUFFER_SIZE = 65536          # Tamanho máximo do buffer de recebimento
-TIMEOUT_RODADA = 5.0         # Segundos sem pacote = fim da rodada
+BUFFER_SIZE = 65536
+TIMEOUT_RODADA = 5.0
+
+# Header: seq(4) + tamanho(4) + timestamp(4) = 12 bytes
+HEADER_FORMAT = "!III"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 
 # ======================================================================
@@ -29,11 +41,6 @@ TIMEOUT_RODADA = 5.0         # Segundos sem pacote = fim da rodada
 # ======================================================================
 
 def receptor_tcp(porta):
-    """
-    Thread que escuta conexões TCP.
-    Para cada conexão, recebe todos os pacotes de uma rodada,
-    registra estatísticas e imprime ao final.
-    """
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     servidor.bind(("0.0.0.0", porta))
@@ -43,51 +50,46 @@ def receptor_tcp(porta):
     while True:
         conn, addr = servidor.accept()
         print(f"\n[TCP] Conexão de {addr}")
-        # Cada conexão é tratada em sua própria thread
         t = threading.Thread(target=tratar_conexao_tcp, args=(conn, addr), daemon=True)
         t.start()
 
 
-def tratar_conexao_tcp(conn, addr):
-    """
-    Trata uma conexão TCP individual.
-    Recebe pacotes até o cliente fechar a conexão.
-    Cada pacote é um JSON com: seq, tamanho, dados, timestamp.
-    """
-    pacotes_recebidos = []       # Lista de (seq, tamanho, timestamp)
-    buffer = b""
+def recv_exato(conn, n):
+    """Recebe exatamente n bytes do socket TCP."""
+    dados = b""
+    while len(dados) < n:
+        parte = conn.recv(n - len(dados))
+        if not parte:
+            return None
+        dados += parte
+    return dados
 
+
+def tratar_conexao_tcp(conn, addr):
+    """Cada mensagem: [4 bytes tamanho][pacote]"""
+    pacotes_recebidos = []
     conn.settimeout(TIMEOUT_RODADA)
 
     try:
         while True:
             try:
-                dados = conn.recv(BUFFER_SIZE)
-                if not dados:
-                    break  # Conexão fechada pelo cliente
-                buffer += dados
-
-                # Processa todas as mensagens completas (delimitadas por \n)
-                while b"\n" in buffer:
-                    msg, buffer = buffer.split(b"\n", 1)
-                    try:
-                        pacote = json.loads(msg.decode("utf-8"))
-                        seq = pacote.get("seq", -1)
-                        tamanho = pacote.get("tamanho", 0)
-                        timestamp = pacote.get("timestamp", 0)
-                        pacotes_recebidos.append((seq, tamanho, timestamp))
-                    except json.JSONDecodeError:
-                        pass
-
+                header_len = recv_exato(conn, 4)
+                if header_len is None:
+                    break
+                msg_len = struct.unpack("!I", header_len)[0]
+                dados = recv_exato(conn, msg_len)
+                if dados is None:
+                    break
+                if len(dados) >= HEADER_SIZE:
+                    seq, tamanho, ts_ms = struct.unpack(HEADER_FORMAT, dados[:HEADER_SIZE])
+                    pacotes_recebidos.append((seq, tamanho, ts_ms))
             except socket.timeout:
                 break
-
     except Exception as e:
         print(f"[TCP] Erro: {e}")
     finally:
         conn.close()
 
-    # Imprime estatísticas da rodada
     imprimir_estatisticas("TCP", pacotes_recebidos)
 
 
@@ -95,52 +97,57 @@ def tratar_conexao_tcp(conn, addr):
 # RECEPTOR UDP
 # ======================================================================
 
-def receptor_udp(porta):
+def receptor_udp(porta, taxa_perda):
     """
-    Thread que escuta pacotes UDP.
-    Para cada pacote recebido: registra e envia ACK de volta.
-    Usa timeout para detectar fim de rodada.
+    Escuta pacotes UDP e envia ACK.
+    Se taxa_perda > 0, simula perda ignorando pacotes aleatoriamente
+    (equivalente a 'tc qdisc add dev lo root netem loss X%' no Linux).
     """
     servidor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     servidor.bind(("0.0.0.0", porta))
     servidor.settimeout(TIMEOUT_RODADA)
-    print(f"[UDP] Escutando na porta {porta}")
+
+    if taxa_perda > 0:
+        print(f"[UDP] Escutando na porta {porta} (SIMULANDO {taxa_perda}% de perda)")
+    else:
+        print(f"[UDP] Escutando na porta {porta}")
 
     while True:
-        pacotes_recebidos = []  # Lista de (seq, tamanho, timestamp)
+        pacotes_recebidos = []
+        pacotes_perdidos_sim = 0
         rodada_ativa = False
 
         while True:
             try:
                 dados, addr = servidor.recvfrom(BUFFER_SIZE)
 
-                try:
-                    pacote = json.loads(dados.decode("utf-8"))
-                    seq = pacote.get("seq", -1)
-                    tamanho = pacote.get("tamanho", 0)
-                    timestamp = pacote.get("timestamp", 0)
-
-                    # Registra o pacote
-                    pacotes_recebidos.append((seq, tamanho, timestamp))
+                if len(dados) >= HEADER_SIZE:
+                    seq, tamanho, ts_ms = struct.unpack(HEADER_FORMAT, dados[:HEADER_SIZE])
 
                     if not rodada_ativa:
                         rodada_ativa = True
                         print(f"\n[UDP] Recebendo pacotes de {addr}...")
 
-                    # Envia ACK manual com o número de sequência
-                    ack = json.dumps({"ack": seq}).encode("utf-8")
+                    # Simula perda: ignora o pacote (não envia ACK)
+                    if taxa_perda > 0 and random.random() < (taxa_perda / 100.0):
+                        pacotes_perdidos_sim += 1
+                        continue  # NÃO envia ACK → sender vai considerar como perdido
+
+                    pacotes_recebidos.append((seq, tamanho, ts_ms))
+
+                    # Envia ACK: 4 bytes com seq
+                    ack = struct.pack("!I", seq)
                     servidor.sendto(ack, addr)
 
-                except json.JSONDecodeError:
-                    pass
-
             except socket.timeout:
-                # Se a rodada estava ativa e parou de receber, imprime stats
                 if rodada_ativa:
-                    imprimir_estatisticas("UDP", pacotes_recebidos)
+                    imprimir_estatisticas("UDP", pacotes_recebidos, pacotes_perdidos_sim)
                     pacotes_recebidos = []
+                    pacotes_perdidos_sim = 0
                     rodada_ativa = False
-                # Continua esperando novos pacotes
+                continue
+            except Exception as e:
+                print(f"[UDP] Erro: {e}")
                 continue
 
 
@@ -148,46 +155,29 @@ def receptor_udp(porta):
 # ESTATÍSTICAS
 # ======================================================================
 
-def imprimir_estatisticas(protocolo, pacotes):
-    """
-    Calcula e imprime estatísticas de uma rodada:
-    - Total de pacotes recebidos
-    - Pacotes fora de ordem
-    - Taxa de perda (baseada nos números de sequência)
-    """
+def imprimir_estatisticas(protocolo, pacotes, perdidos_sim=0):
     if not pacotes:
         print(f"\n[{protocolo}] Nenhum pacote recebido nesta rodada.")
         return
 
     total = len(pacotes)
     seqs = [p[0] for p in pacotes]
-
-    # Calcula o esperado (do menor ao maior seq recebido)
-    seq_min = min(seqs)
-    seq_max = max(seqs)
+    seq_min, seq_max = min(seqs), max(seqs)
     esperados = seq_max - seq_min + 1
 
-    # Pacotes fora de ordem: quantos não estão em ordem crescente
-    fora_de_ordem = 0
-    for i in range(1, len(seqs)):
-        if seqs[i] < seqs[i-1]:
-            fora_de_ordem += 1
-
-    # Taxa de perda
+    fora_de_ordem = sum(1 for i in range(1, len(seqs)) if seqs[i] < seqs[i-1])
     perdidos = esperados - total
     taxa_perda = (perdidos / esperados * 100) if esperados > 0 else 0
-
     tamanho = pacotes[0][1] if pacotes else 0
 
     print(f"\n{'='*50}")
     print(f"  ESTATÍSTICAS — {protocolo}")
     print(f"{'='*50}")
     print(f"  Tamanho do pacote: {tamanho} bytes")
-    print(f"  Pacotes esperados: {esperados}")
     print(f"  Pacotes recebidos: {total}")
-    print(f"  Pacotes perdidos:  {perdidos}")
+    if perdidos_sim > 0:
+        print(f"  Perdidos (simulado): {perdidos_sim}")
     print(f"  Fora de ordem:     {fora_de_ordem}")
-    print(f"  Taxa de perda:     {taxa_perda:.1f}%")
     print(f"{'='*50}")
 
 
@@ -199,22 +189,26 @@ def main():
     parser = argparse.ArgumentParser(description="Receptor Benchmark TCP/UDP")
     parser.add_argument("--port", type=int, default=6000,
                         help="Porta base (TCP=port, UDP=port+1). Padrão: 6000")
+    parser.add_argument("--loss", type=float, default=0,
+                        help="Simular perda de pacotes UDP (%%). Ex: --loss 10 = 10%% de perda")
     args = parser.parse_args()
 
     porta_tcp = args.port
     porta_udp = args.port + 1
 
-    print("=" * 50)
+    print("=" * 55)
     print("  RECEPTOR — Benchmark TCP vs UDP")
-    print("=" * 50)
+    print("=" * 55)
     print(f"  TCP na porta {porta_tcp}")
     print(f"  UDP na porta {porta_udp}")
+    if args.loss > 0:
+        print(f"  ⚠️  Simulação de perda UDP: {args.loss}%")
+    print(f"  Protocolo: binário ({HEADER_SIZE} bytes header)")
     print("  Pressione Ctrl+C para encerrar")
-    print("=" * 50)
+    print("=" * 55)
 
-    # Inicia ambos receptores em threads separadas
     t_tcp = threading.Thread(target=receptor_tcp, args=(porta_tcp,), daemon=True)
-    t_udp = threading.Thread(target=receptor_udp, args=(porta_udp,), daemon=True)
+    t_udp = threading.Thread(target=receptor_udp, args=(porta_udp, args.loss), daemon=True)
     t_tcp.start()
     t_udp.start()
 
