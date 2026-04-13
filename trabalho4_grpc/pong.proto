@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package pong;
+
+// =====================================================================
+// SERVIÇO PONG — Interface Remota Principal
+// =====================================================================
+// Expõe os 3 métodos RPC que os clientes invocam remotamente.
+// Equivalente ao conceito de Java RMI em Python via gRPC.
+
+service PongService {
+
+  // Registra um novo jogador. Retorna ID 1 ou 2.
+  // Bloqueia o segundo cliente até que o primeiro já esteja conectado.
+  rpc ConectarJogador (ConectarRequest) returns (ConectarResponse);
+
+  // Move a raquete do jogador informado para cima ou para baixo.
+  // Chamado a cada frame em que o jogador pressiona uma tecla.
+  rpc MoverRaquete (MoverRequest) returns (MoverResponse);
+
+  // Retorna o estado completo e atual do jogo.
+  // Chamado em polling pelo cliente a cada ~16ms (60fps).
+  rpc ObterEstado (EstadoRequest) returns (EstadoResponse);
+}
+
+
+// =====================================================================
+// MENSAGENS — ConectarJogador
+// =====================================================================
+
+message ConectarRequest {
+  // Pode ser vazio; reservado para futuro uso (ex: nome do jogador)
+  string nome = 1;
+}
+
+message ConectarResponse {
+  bool   sucesso     = 1;  // true se conexão aceita, false se jogo cheio
+  int32  id_jogador  = 2;  // 1 ou 2
+  string mensagem    = 3;  // Mensagem descritiva (ex: "Aguardando P2...")
+}
+
+
+// =====================================================================
+// MENSAGENS — MoverRaquete
+// =====================================================================
+
+message MoverRequest {
+  int32  id_jogador = 1;  // 1 ou 2
+  string direcao    = 2;  // "cima", "baixo" ou "parado"
+}
+
+message MoverResponse {
+  bool sucesso = 1;
+}
+
+
+// =====================================================================
+// MENSAGENS — ObterEstado
+// =====================================================================
+
+message EstadoRequest {
+  int32 id_jogador = 1;  // Quem está pedindo (usado para atualizar heartbeat)
+}
+
+message EstadoResponse {
+  // Posição dos objetos do jogo
+  float bola_x      = 1;
+  float bola_y      = 2;
+  float raquete1_y  = 3;
+  float raquete2_y  = 4;
+
+  // Placar
+  int32 placar1 = 5;
+  int32 placar2 = 6;
+
+  // Status da partida
+  // "aguardando"  → esperando P2 conectar
+  // "jogando"     → partida em andamento
+  // "encerrado"   → partida encerrada (vitória normal ou W.O.)
+  string status    = 7;
+  int32  vencedor  = 8;  // 0 = nenhum ainda, 1 = P1 venceu, 2 = P2 venceu
+  string motivo    = 9;  // "placar" ou "wo" (walkover por desconexão)
+
+  // Número de sequência do frame (útil para diagnóstico de latência)
+  int64 seq = 10;
+}
