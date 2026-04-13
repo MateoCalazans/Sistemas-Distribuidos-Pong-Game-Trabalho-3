@@ -8,7 +8,7 @@
 ::   rodar.bat gerar-proto      → Regenera os arquivos pb2 do .proto
 :: =====================================================================
 
-SET PYTHON="C:\Program Files\PostgreSQL\18\pgAdmin 4\python\python.exe"
+SET PYTHON="C:\Users\guife\AppData\Local\Programs\Python\Python311\python.exe"
 
 if "%1"=="servidor" (
     echo [PONG] Iniciando servidor gRPC...
